@@ -1,8 +1,7 @@
-fastapi
-uvicorn
-lightgbm
-joblib
-pandas
-numpy<2.0.0
-python-multipart
-scikit-learn
+fastapi==0.115.0
+uvicorn==0.30.6
+scikit-learn== 1.6.1
+pandas==2.2.3
+numpy==1.26.4
+joblib==1.4.2
+pydantic==2.9.2
