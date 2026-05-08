@@ -52,7 +52,7 @@ def engineer_features(data: dict) -> pd.DataFrame:
 def root():
     return {"message": "Crop Recommendation API is running. Visit /docs for the interactive UI."}
 
-@app.post("/predict-explain", response_model=CropExplainOutput)
+@app.post("/predict", response_model=CropExplainOutput)
 def predict_and_explain(input_data: CropInput):
     try:
         raw_inputs = input_data.model_dump()
