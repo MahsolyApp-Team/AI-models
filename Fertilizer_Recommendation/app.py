@@ -12,11 +12,12 @@ import shap
 
 # ─── GEMINI CONFIG ────────────────────────────────────────────────────────────
 
-GEMINI_API_KEY = "AIzaSyCLWQX0uf2YMxDaCBec5NXd9zypIk_Ng9Y"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
     "gemini-2.5-flash:generateContent"
 )
+ 
 
 # ─── MODEL LOADING ────────────────────────────────────────────────────────────
 
