@@ -11,11 +11,9 @@ WORKDIR /app
 COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-# Copy app files and model artifacts
+# Copy app files and the entire Model directory
 COPY --chown=user app.py .
-COPY --chown=user rf_model.pkl .
-COPY --chown=user label_encoder.pkl .
-COPY --chown=user feature_names.pkl .
+COPY --chown=user Model/ ./Model/
 
 # Hugging Face Spaces expects port 7860
 EXPOSE 7860
