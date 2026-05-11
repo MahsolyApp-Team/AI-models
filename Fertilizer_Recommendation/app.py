@@ -1,5 +1,5 @@
 import os
-import pickle
+import joblib
 import httpx
 import numpy as np
 import pandas as pd
@@ -8,49 +8,48 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 from sklearn.pipeline import Pipeline
 from contextlib import asynccontextmanager
+from dotenv import load_dotenv
 import shap
 
 # ─── GEMINI CONFIG ────────────────────────────────────────────────────────────
 
+load_dotenv(override=True)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_URL = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.5-flash:generateContent"
-)
- 
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+
+# Fallback chain: if one hits rate limit, try the next
+GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
 
 # ─── MODEL LOADING ────────────────────────────────────────────────────────────
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "model")
 
-def load_artifact(filename):
-    path = os.path.join(MODEL_DIR, filename)
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Model artifact not found: {path}")
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-# Globals populated at startup
-rf_model     = None
-scaler       = None
-le_soil      = None
-le_crop      = None
-le_target    = None
-column_names = None
-pipeline     = None
-explainer    = None
+models = {
+    "rf_model":     None,
+    "scaler":       None,
+    "le_soil":      None,
+    "le_crop":      None,
+    "le_target":    None,
+    "column_names": None,
+    "pipeline":     None,
+    "explainer":    None,
+}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global rf_model, scaler, le_soil, le_crop, le_target, column_names, pipeline, explainer
-    rf_model     = load_artifact("rf_model.pkl")
-    scaler       = load_artifact("scaler.pkl")
-    le_soil      = load_artifact("le_soil.pkl")
-    le_crop      = load_artifact("le_crop.pkl")
-    le_target    = load_artifact("le_target.pkl")
-    column_names = load_artifact("column_names.pkl")
-    pipeline     = Pipeline([("scaler", scaler), ("rf_model", rf_model)])
-    explainer    = shap.TreeExplainer(rf_model)
+    models["rf_model"]     = joblib.load(os.path.join(MODEL_DIR, "rf_model.pkl"))
+    models["scaler"]       = joblib.load(os.path.join(MODEL_DIR, "scaler.pkl"))
+    models["le_soil"]      = joblib.load(os.path.join(MODEL_DIR, "le_soil.pkl"))
+    models["le_crop"]      = joblib.load(os.path.join(MODEL_DIR, "le_crop.pkl"))
+    models["le_target"]    = joblib.load(os.path.join(MODEL_DIR, "le_target.pkl"))
+    models["column_names"] = joblib.load(os.path.join(MODEL_DIR, "column_names.pkl"))
+    models["pipeline"]     = Pipeline([("scaler", models["scaler"]), ("rf_model", models["rf_model"])])
+    models["explainer"]    = shap.TreeExplainer(models["rf_model"])
     print("Model artifacts and SHAP explainer loaded successfully.")
     yield
 
@@ -100,36 +99,45 @@ class FertilizerRequest(BaseModel):
 
 
 class FeatureContribution(BaseModel):
-    feature:     str   = Field(description="Feature name")
-    value:       float = Field(description="Actual input value for this feature")
-    shap_value:  float = Field(description="SHAP value: magnitude and direction of impact")
-    direction:   str   = Field(description="'increases' or 'decreases' the prediction confidence")
-    impact:      str   = Field(description="'high', 'medium', or 'low' relative impact")
+    feature:    str   = Field(description="Feature name")
+    value:      float = Field(description="Actual input value for this feature")
+    shap_value: float = Field(description="SHAP value: magnitude and direction of impact")
+    direction:  str   = Field(description="'increases' or 'decreases' the prediction confidence")
+    impact:     str   = Field(description="'high', 'medium', or 'low' relative impact")
 
 
 class SHAPExplanation(BaseModel):
-    predicted_class:      str   = Field(description="The fertilizer being explained")
-    base_value:           float = Field(description="Model baseline confidence before any features")
-    final_confidence:     float = Field(description="Final predicted confidence for this class")
-    top_features:         list[FeatureContribution] = Field(
-                              description="Top features ranked by absolute SHAP impact"
-                          )
+    predicted_class:  str   = Field(description="The fertilizer being explained")
+    base_value:       float = Field(description="Model baseline confidence before any features")
+    final_confidence: float = Field(description="Final predicted confidence for this class")
+    top_features:     list[FeatureContribution] = Field(
+                          description="Top features ranked by absolute SHAP impact"
+                      )
 
 
 class FertilizerResponse(BaseModel):
     predicted_fertilizer: str
     confidence:           float
-    explanation:          str   = Field(description="Plain-language explanation generated by Gemini")
+    explanation:          str = Field(description="Plain-language explanation generated by Gemini")
 
 
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
+FEATURE_META = {
+    "Temparature": ("Temperature",     "°C",    "air/soil temperature"),
+    "Humidity":    ("Humidity",        "%",     "relative air humidity"),
+    "Moisture":    ("Soil Moisture",   "%",     "water content in the soil"),
+    "Soil Type":   ("Soil Type",       "",      "type of soil"),
+    "Crop Type":   ("Crop Type",       "",      "crop being grown"),
+    "Nitrogen":    ("Nitrogen (N)",    "kg/ha", "nitrogen nutrients in the soil"),
+    "Potassium":   ("Potassium (K)",   "kg/ha", "potassium nutrients in the soil"),
+    "Phosphorous": ("Phosphorous (P)", "kg/ha", "phosphorous nutrients in the soil"),
+}
+
 def classify_impact(shap_val: float, max_abs: float) -> str:
     ratio = abs(shap_val) / max_abs if max_abs > 0 else 0
-    if ratio >= 0.5:
-        return "high"
-    if ratio >= 0.2:
-        return "medium"
+    if ratio >= 0.5: return "high"
+    if ratio >= 0.2: return "medium"
     return "low"
 
 
@@ -140,20 +148,18 @@ def compute_shap_explanation(
     confidence: float,
     original_values: dict,
 ) -> SHAPExplanation:
-    """
-    Run SHAP on the scaled input and return a structured explanation
-    for the predicted class.
-    """
-    scaled = scaler.transform(input_df)
-    scaled_df = pd.DataFrame(scaled, columns=column_names)
+    scaler       = models["scaler"]
+    column_names = models["column_names"]
+    explainer    = models["explainer"]
 
+    scaled_df   = pd.DataFrame(scaler.transform(input_df), columns=column_names)
     shap_values = explainer.shap_values(scaled_df)
 
-    # Support both old SHAP (list of 2-D arrays) and new (3-D array)
-    if isinstance(shap_values, list):
-        sample_shap = shap_values[class_idx][0]          # shape: (n_features,)
-    else:
-        sample_shap = shap_values[0, :, class_idx]       # shape: (n_features,)
+    sample_shap = (
+        shap_values[class_idx][0]
+        if isinstance(shap_values, list)
+        else shap_values[0, :, class_idx]
+    )
 
     expected_val = (
         float(explainer.expected_value[class_idx])
@@ -163,26 +169,23 @@ def compute_shap_explanation(
 
     max_abs = float(np.max(np.abs(sample_shap))) if len(sample_shap) > 0 else 1.0
 
-    contributions = []
-    for feat, sv in zip(column_names, sample_shap):
-        raw_val = original_values.get(feat, 0.0)
-        contributions.append(FeatureContribution(
+    contributions = [
+        FeatureContribution(
             feature    = feat,
-            value      = round(float(raw_val), 4),
+            value      = round(float(original_values.get(feat, 0.0)), 4),
             shap_value = round(float(sv), 6),
             direction  = "increases" if sv >= 0 else "decreases",
             impact     = classify_impact(sv, max_abs),
-        ))
-
-    # Sort by absolute SHAP descending
+        )
+        for feat, sv in zip(column_names, sample_shap)
+    ]
     contributions.sort(key=lambda x: abs(x.shap_value), reverse=True)
-
 
     return SHAPExplanation(
         predicted_class  = predicted_fertilizer,
         base_value       = round(expected_val, 6),
         final_confidence = round(confidence, 4),
-        top_features     = contributions
+        top_features     = contributions,
     )
 
 
@@ -192,30 +195,27 @@ def build_local_explanation(
     soil_type: str,
     shap_explanation: SHAPExplanation,
 ) -> str:
-    """Generate a technical SHAP-based explanation for agricultural engineers."""
-    summary = [
-        f"The model predicted {fertilizer} for {crop_type} on {soil_type} soil. SHAP values explain each feature's contribution to this prediction.",
-    ]
+    """Farmer-friendly fallback explanation when all Gemini models are unavailable."""
+    FEATURE_REASONS = {
+        "Nitrogen":    "Nitrogen is the main nutrient that helps plants grow green and strong.",
+        "Potassium":   "Potassium helps roots grow and keeps your plants healthy.",
+        "Phosphorous": "Phosphorous gives plants the energy they need to flower and produce.",
+        "Moisture":    "Soil moisture tells us how much water is currently in your soil.",
+        "Temparature": "Temperature affects how fast your plants can absorb nutrients.",
+        "Humidity":    "Humidity affects how quickly fertilizer dissolves and reaches the roots.",
+        "Soil Type":   "Your soil type affects how well it holds and releases nutrients.",
+        "Crop Type":   "Different crops have different nutrient needs.",
+    }
+
+    summary = [f"{fertilizer} is the right choice for your {crop_type} crop on {soil_type} soil."]
 
     for fc in shap_explanation.top_features[:4]:
-        value = fc.value if fc.feature not in ["Soil Type", "Crop Type"] else (soil_type if fc.feature == "Soil Type" else crop_type)
-        direction = "increased" if fc.direction == "increases" else "decreased"
-        reason = {
-            "Nitrogen": "Nitrogen is crucial for plant growth; low levels push toward N-rich fertilizers like Urea.",
-            "Potassium": "Potassium affects root development; deficiencies favor K-containing fertilizers.",
-            "Phosphorous": "Phosphorous supports energy transfer; low P levels recommend P-rich options.",
-            "Moisture": "Soil moisture influences nutrient absorption; dry conditions may favor quick-release fertilizers.",
-            "Temparature": "Temperature affects microbial activity and nutrient uptake rates.",
-            "Humidity": "Humidity impacts evaporation and nutrient retention in soil.",
-            "Soil Type": "Soil texture affects nutrient availability and fertilizer efficiency.",
-            "Crop Type": "Different crops have varying nutrient requirements.",
-        }.get(fc.feature, f"{fc.feature} influences fertilizer selection based on crop needs.")
+        value  = fc.value if fc.feature not in ["Soil Type", "Crop Type"] else (soil_type if fc.feature == "Soil Type" else crop_type)
+        pushed = "helped choose" if fc.direction == "increases" else "was also considered"
+        reason = FEATURE_REASONS.get(fc.feature, f"{fc.feature} plays a role in fertilizer selection.")
+        summary.append(f"{reason} Your reading of {value} {pushed} {fertilizer} for your field.")
 
-        summary.append(
-            f"{fc.feature} (value: {value}) has SHAP value {fc.shap_value:.4f}, which {direction} the model's confidence for {fertilizer} with {fc.impact} impact. {reason}"
-        )
-
-    summary.append("These contributions led to the final prediction.")
+    summary.append(f"Apply {fertilizer} evenly across your field and water it in well so the nutrients reach the roots.")
     return " ".join(summary)
 
 
@@ -226,123 +226,66 @@ async def get_gemini_explanation(
     crop_type: str,
     soil_type: str,
 ) -> str:
-    """
-    Send SHAP values to Gemini and get back a plain-language explanation
-    for why the model recommended this fertilizer.
-    """
+    """Try each Gemini model in order. If all fail, return a sorry message."""
     if not GEMINI_API_KEY:
         raise HTTPException(
             status_code=500,
             detail="GEMINI_API_KEY environment variable is not set.",
         )
 
-    # ── Build structured feature table for Gemini ─────────────────────────────
-    FEATURE_META = {
-        "Temparature":   ("Temperature",     "°C",    "air/soil temperature"),
-        "Humidity":      ("Humidity",         "%",     "relative air humidity"),
-        "Moisture":      ("Soil Moisture",    "%",     "water content in the soil"),
-        "Soil Type":     ("Soil Type",        "",      "type of soil"),
-        "Crop Type":     ("Crop Type",        "",      "crop being grown"),
-        "Nitrogen":      ("Nitrogen (N)",     "kg/ha", "nitrogen nutrients in the soil"),
-        "Potassium":     ("Potassium (K)",    "kg/ha", "potassium nutrients in the soil"),
-        "Phosphorous":   ("Phosphorous (P)",  "kg/ha", "phosphorous nutrients in the soil"),
-    }
+    top_4         = shap_explanation.top_features[:4]
+    shap_summary  = ", ".join([
+        f"{FEATURE_META.get(fc.feature, (fc.feature,))[0]} ({'more' if fc.direction == 'increases' else 'less'} important)"
+        for fc in top_4
+    ])
+    input_summary = ", ".join([
+        f"{FEATURE_META.get(fc.feature, (fc.feature,))[0]}={fc.value}"
+        for fc in top_4
+    ])
 
-    # Build one row per feature: name | value | pushed toward or away | strength
-    rows = []
-    for fc in shap_explanation.top_features[:6]:
-        meta  = FEATURE_META.get(fc.feature, (fc.feature, "", fc.feature))
-        label, unit, meaning = meta
-        val   = f"{fc.value} {unit}".strip()
-        push  = f"pushed TOWARD {fertilizer}" if fc.direction == "increases" else f"pushed AWAY from {fertilizer}"
-        rows.append(f"  • {label} = {val} | {push} | strength: {fc.impact.upper()} | meaning: {meaning}")
+    prompt = f"""You are a friendly agricultural advisor explaining a fertilizer recommendation to a farmer with no technical background.
+The recommended fertilizer is '{fertilizer}' for a '{crop_type}' crop on '{soil_type}' soil.
+The conditions are: {input_summary}.
+The main factors behind this recommendation are: {shap_summary}.
 
-    features_block = "\n".join(rows)
+Write a simple, friendly explanation (under 120 words) that answers: "Why is {fertilizer} the right choice for these conditions?"
 
-    # ── Few-shot example so Gemini understands the expected depth ─────────────
-    few_shot_example = """EXAMPLE INPUT:
-Fertilizer: Urea | Crop: Maize | Soil: Sandy
-  • Nitrogen (N) = 10 kg/ha | pushed TOWARD Urea | strength: HIGH | meaning: nitrogen nutrients in the soil
-  • Moisture = 20 % | pushed TOWARD Urea | strength: HIGH | meaning: water content in the soil
-  • Phosphorous (P) = 50 kg/ha | pushed AWAY from Urea | strength: MEDIUM | meaning: phosphorous nutrients in the soil
-  • Potassium (K) = 45 kg/ha | pushed AWAY from Urea | strength: MEDIUM | meaning: potassium nutrients in the soil
-  • Temperature = 32 °C | pushed TOWARD Urea | strength: LOW | meaning: air/soil temperature
-  • Humidity = 40 % | pushed TOWARD Urea | strength: LOW | meaning: relative air humidity
-
-EXAMPLE OUTPUT:
-Urea is recommended for your Maize crop on Sandy soil because Maize is a heavy nitrogen feeder and your soil is critically low in nitrogen right now.
-
-Your nitrogen level is only 10 kg/ha, which is far too low for healthy Maize growth — this was the single biggest reason the system pointed to Urea, since Urea is 46% nitrogen and will quickly correct this deficiency. Your soil moisture is at 20%, which is on the dry side — this actually supports using Urea because drier soils absorb urea-based fertilizers efficiently without the nitrogen escaping as gas. Your phosphorous level is 50 kg/ha, which is already adequate for Maize — because your phosphorous is fine, the system saw no need for a phosphorous-heavy fertilizer, which is one reason it moved away from compound fertilizers and settled on pure Urea. Your potassium reads 45 kg/ha, which is also sufficient — similar to phosphorous, good potassium levels meant the system had no reason to pick a fertilizer with added potassium, reinforcing the choice of nitrogen-only Urea. The temperature of 32°C is warm, which slightly favored Urea since nitrogen uptake by Maize roots is more active in warm conditions. The humidity at 40% is moderate and played a small role — lower humidity reduces the risk of nitrogen loss through evaporation when using Urea, making it a safer choice under these conditions.
-
-To apply: spread Urea evenly across your field and irrigate or wait for light rain within 24 hours so the nitrogen dissolves into the soil before any is lost to the air."""
-
-    # ── Final prompt ──────────────────────────────────────────────────────────
-    prompt = (
-        "You are an expert agricultural advisor. "
-        "A farmer's smart fertilizer system analyzed their field and picked a fertilizer. "
-        "Your job is to explain the reasoning behind that recommendation in clear, grounded language — "
-        "specifically referencing EACH measurement and exactly how it contributed to the decision.\n\n"
-        "Study this example carefully to understand the required depth and format:\n\n"
-        f"{few_shot_example}\n\n"
-        "---\n"
-        "Now write the same style of explanation for this new case:\n\n"
-        f"Fertilizer: {fertilizer} | Crop: {crop_type} | Soil: {soil_type}\n"
-        f"{features_block}\n\n"
-        "Requirements (strictly follow):\n"
-        "- Start with ONE sentence: why this fertilizer generally suits this crop and soil type.\n"
-        "- Then write ONE dedicated paragraph per factor (all 6), in the same order as listed.\n"
-        "  Each paragraph must mention: the actual measured number, what that number means for the crop, "
-        "  and whether it pushed the recommendation toward or away from this fertilizer and why.\n"
-        "- End with ONE practical application tip sentence.\n"
-        "- Never use the words: SHAP, model, AI, ML, algorithm, encoded, confidence.\n"
-        "- Always say 'your soil', 'your crop', 'your field'.\n"
-        "- Output plain text only. No bullet points, no headers, no markdown."
-    )
+Rules:
+- Use plain everyday language. No jargon, no scientific terms.
+- Focus on practical reasons a farmer would understand (e.g., "your soil is low on nitrogen, and this fertilizer will fix that quickly").
+- If you must use a technical term, explain it right away in simple words.
+- Do NOT mention SHAP values, numbers from the data, model, or AI — just explain the 'why' in plain words.
+- Always say 'your soil', 'your crop', 'your field'.
+- Keep a warm, helpful tone as if talking to a friend.
+- Output plain text only. No bullet points, no headers, no markdown."""
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 4000},
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1000},
     }
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        try:
-            resp = await client.post(
-                GEMINI_URL,
-                params={"key": GEMINI_API_KEY},
-                json=payload,
-            )
-        except httpx.HTTPError:
-            return build_local_explanation(
-                fertilizer=fertilizer,
-                crop_type=crop_type,
-                soil_type=soil_type,
-                shap_explanation=shap_explanation,
-            )
+    async with httpx.AsyncClient(timeout=21.0) as client:
+        for model in GEMINI_MODELS:
+            url = f"{GEMINI_BASE_URL}/{model}:generateContent"
+            try:
+                resp = await client.post(url, params={"key": GEMINI_API_KEY}, json=payload)
+            except httpx.HTTPError:
+                continue  # network error → try next model
 
-    if resp.status_code != 200:
-        return build_local_explanation(
-            fertilizer=fertilizer,
-            crop_type=crop_type,
-            soil_type=soil_type,
-            shap_explanation=shap_explanation,
-        )
+            if resp.status_code in (429, 500, 503):
+                continue  # rate limit or server error → try next model
 
-    data = resp.json()
-    try:
-        candidate    = data["candidates"][0]
-        finish_reason = candidate.get("finishReason", "UNKNOWN")
-        text          = candidate["content"]["parts"][0]["text"].strip()
-        # Log truncation warning in the response if Gemini cut off early
-        if finish_reason == "MAX_TOKENS":
-            text += "\n\n[Note: explanation was truncated — increase maxOutputTokens if needed]"
-        return text
-    except (KeyError, IndexError, ValueError):
-        return build_local_explanation(
-            fertilizer=fertilizer,
-            crop_type=crop_type,
-            soil_type=soil_type,
-            shap_explanation=shap_explanation,
-        )
+            if resp.status_code != 200:
+                #print(f"{model} failed:", resp.status_code, resp.text)
+                continue
+
+            try:
+                return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+            except (KeyError, IndexError, ValueError):
+                continue  # malformed response → try next model
+
+    # All models exhausted
+    return "Sorry, explanation is not available right now."
 
 
 # ─── ENDPOINTS ────────────────────────────────────────────────────────────────
@@ -358,39 +301,39 @@ def root():
 @app.get("/categories", tags=["General"])
 def get_categories():
     """Return all valid string values for Soil Type and Crop Type."""
-    if le_soil is None or le_crop is None:
+    if models["le_soil"] is None or models["le_crop"] is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet.")
     return {
-        "soil_types": list(le_soil.classes_),
-        "crop_types": list(le_crop.classes_),
+        "soil_types": list(models["le_soil"].classes_),
+        "crop_types": list(models["le_crop"].classes_),
     }
 
 
 @app.post("/predict", response_model=FertilizerResponse, tags=["Prediction"])
 async def predict(request: FertilizerRequest):
     """
-    Predict the best fertilizer and return a SHAP-based explanation
-    describing which features drove the recommendation and why.
+    Predict the best fertilizer and return a plain-language explanation
+    describing which factors drove the recommendation and why.
     """
-    if pipeline is None:
+    if models["pipeline"] is None:
         raise HTTPException(status_code=503, detail="Model not loaded yet.")
 
     # ── Encode categoricals ──────────────────────────────────────────────────
     try:
-        soil_encoded = int(le_soil.transform([request.Soil_Type])[0])
+        soil_encoded = int(models["le_soil"].transform([request.Soil_Type])[0])
     except ValueError:
         raise HTTPException(
             status_code=422,
             detail=f"Unknown Soil Type: '{request.Soil_Type}'. "
-                   f"Valid options: {list(le_soil.classes_)}"
+                   f"Valid options: {list(models['le_soil'].classes_)}"
         )
     try:
-        crop_encoded = int(le_crop.transform([request.Crop_Type])[0])
+        crop_encoded = int(models["le_crop"].transform([request.Crop_Type])[0])
     except ValueError:
         raise HTTPException(
             status_code=422,
             detail=f"Unknown Crop Type: '{request.Crop_Type}'. "
-                   f"Valid options: {list(le_crop.classes_)}"
+                   f"Valid options: {list(models['le_crop'].classes_)}"
         )
 
     raw = {
@@ -405,18 +348,18 @@ async def predict(request: FertilizerRequest):
     }
 
     try:
-        input_df = pd.DataFrame([raw])[column_names]
+        input_df = pd.DataFrame([raw])[models["column_names"]]
     except KeyError as e:
         raise HTTPException(
             status_code=422,
-            detail=f"Feature mismatch: {e}. Expected columns: {column_names}"
+            detail=f"Feature mismatch: {e}. Expected columns: {models['column_names']}"
         )
 
     # ── Predict ───────────────────────────────────────────────────────────────
-    encoded_pred = pipeline.predict(input_df)[0]
-    proba        = pipeline.predict_proba(input_df)[0]
+    encoded_pred = models["pipeline"].predict(input_df)[0]
+    proba        = models["pipeline"].predict_proba(input_df)[0]
     confidence   = round(float(proba[encoded_pred]), 4)
-    fertilizer   = str(le_target.inverse_transform([encoded_pred])[0])
+    fertilizer   = str(models["le_target"].inverse_transform([encoded_pred])[0])
 
     # ── SHAP explanation (internal) ───────────────────────────────────────────
     shap_explanation = compute_shap_explanation(

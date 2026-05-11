@@ -15,6 +15,13 @@ load_dotenv(override=True)
 # It automatically looks for the GEMINI_API_KEY environment variable if you don't pass it explicitly.
 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
+# Fallback chain: if one hits rate limit, try the next
+GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = os.path.join(BASE_DIR, "Model")
 
@@ -77,27 +84,40 @@ def predict_and_explain(input_data: CropInput):
         shap_summary = ", ".join([f"{feat} ({'+' if val > 0 else '-'}{abs(val):.2f})" for feat, val in top_4])
         input_summary = ", ".join([f"{k}={v}" for k, v in raw_inputs.items()])
 
-        # 3. Generate Physiological Explanation with the new Gemini SDK
+       # 3. Generate Physiological Explanation with the new Gemini SDK
         system_prompt = f"""
-        You are an expert agronomist explaining a machine learning crop recommendation to a fellow agriculture engineer.
-        The model recommended '{crop.upper()}' based on these exact conditions: {input_summary}.
+        You are a friendly agricultural advisor explaining a crop recommendation to a farmer with no technical background.
+        The model recommended '{crop.upper()}' based on these conditions: {input_summary}.
         
-        The top 4 mathematical drivers (SHAP values) for this decision are: {shap_summary}.
-        (Positive values pushed the model toward this crop; negative values pushed it away).
+        The main factors that led to this recommendation are: {shap_summary}.
         
-        Write a concise, insightful explanation (under 150 words) focusing strictly on plant biology and physiology. Explain WHY these specific environmental or nutrient values physically make sense for {crop.upper()}'s biological needs (e.g., nodule formation, root development, transpiration, drought tolerance). 
-        Do not just repeat the numbers; explain the biological 'why' behind them.
+        Write a simple, friendly explanation (under 120 words) that answers: "Why is {crop.upper()} the right choice for these conditions?"
+        
+        Rules:
+        - Use plain everyday language. No jargon, no scientific terms.
+        - Focus on practical reasons a farmer would understand (e.g., "this crop handles dry weather well" instead of "exhibits drought tolerance via stomatal regulation").
+        - If you must use a technical term, explain it in one simple phrase right after.
+        - Do NOT mention SHAP values, model, or numbers — just explain the 'why' in plain words.
+        - Keep a warm, helpful tone as if talking to a friend.
         """
         
-        # New API Call Syntax
-        response = client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=system_prompt,
-        )
-        
+        # Try each Gemini model in order until one succeeds
+        explanation = None
+        for model in GEMINI_MODELS:
+            try:
+                print(f"Trying {model}...")
+                response = client.models.generate_content(
+                    model=model,
+                    contents=system_prompt,
+                )
+                explanation = response.text.strip()
+                break
+            except Exception:
+                continue  # rate limit or error → try next model
+
         return CropExplainOutput(
             recommended_crop=crop,
-            explanation=response.text.strip()
+            explanation=explanation or "Sorry, explanation is not available right now."
         )
         
     except Exception as e:
