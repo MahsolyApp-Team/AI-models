@@ -1,0 +1,17 @@
+# Web framework
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+python-multipart==0.0.12     # required for UploadFile / File()
+
+# Deep learning
+torch==2.5.1
+torchvision==0.20.1
+
+# Image augmentation (must match training pipeline exactly)
+albumentations==1.4.22
+
+# Image I/O
+Pillow==11.0.0
+
+# Numerical
+numpy==1.26.4

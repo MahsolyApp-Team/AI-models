@@ -1,6 +1,6 @@
 Docs/
 Plant_disease_detection/
-vgg19/
 .env
 __pycache__/
 *.py[cod]
+*.pth
