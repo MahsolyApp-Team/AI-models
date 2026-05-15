@@ -7,6 +7,9 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
 import io
+import os
+import httpx
+from dotenv import load_dotenv
 
 # =====================
 # Device
@@ -82,7 +85,9 @@ for param in model.features.parameters():
 num_in_features = model.classifier[6].in_features
 model.classifier[6] = nn.Linear(num_in_features, len(label_map))
 
-model.load_state_dict(torch.load("vgg19_rgb_model.pth", map_location=device))
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+model.load_state_dict(torch.load(os.path.join(BASE_DIR, "vgg19_rgb_model.pth"), map_location=device))
+
 model = model.to(device)
 model.eval()
 
@@ -121,6 +126,133 @@ def detect_leaf(image: Image.Image):
     }
 
 # =====================
+# Gemini Treatment Plan
+# =====================
+
+# Ordered list of Gemini models to try (fallback chain)
+GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+]
+
+load_dotenv(override = True)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+GEMINI_PROMPT_TEMPLATE = """You are a plant pathology expert. For the plant disease "{disease_name}", provide a brief structured response with exactly these 3 sections:
+
+Symptoms: (2-3 key visible symptoms)
+Treatment: (2-3 actionable treatment steps)
+Prevention: (2-3 prevention tips)
+
+Be concise. No extra text."""
+
+
+async def get_treatment_plan(disease_name: str) -> dict:
+    """
+    Try each Gemini model in order. Return treatment plan on first success.
+    If all models fail, return a service unavailable notice.
+    """
+    if not GEMINI_API_KEY:
+        return {
+            "treatment_plan": None,
+            "treatment_plan_status": "Treatment plan service is not available now."
+        }
+
+    prompt = GEMINI_PROMPT_TEMPLATE.format(disease_name=disease_name)
+    last_error = ""
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        for model_name in GEMINI_MODELS:
+            print(f"Trying Gemini model: {model_name}")
+            url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{model_name}:generateContent?key={GEMINI_API_KEY}"
+            )
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "maxOutputTokens": 300,
+                    "temperature": 0.3
+                }
+            }
+
+            try:
+                response = await client.post(url, json=payload)
+
+                # Quota / rate-limit errors → try next model
+                if response.status_code in (429, 503, 500):
+                    last_error = f"{model_name}: HTTP {response.status_code}"
+                    continue
+
+                if response.status_code != 200:
+                    last_error = f"{model_name}: HTTP {response.status_code}"
+                    continue
+
+                data = response.json()
+
+                # Extract text safely
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    last_error = f"{model_name}: empty candidates"
+                    continue
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if not parts:
+                    last_error = f"{model_name}: empty parts"
+                    continue
+
+                treatment_text = parts[0].get("text", "").strip()
+                if not treatment_text:
+                    last_error = f"{model_name}: empty text"
+                    continue
+
+                # Success — parse into structured sections
+                return {
+                    "treatment_plan": parse_treatment_sections(treatment_text),
+                    "treatment_plan_status": "ok",
+                    "model_used": model_name
+                }
+
+            except (httpx.TimeoutException, httpx.RequestError) as e:
+                last_error = f"{model_name}: {str(e)}"
+                continue
+
+    # All models exhausted
+    return {
+        "treatment_plan": None,
+        "treatment_plan_status": "Treatment plan service is not available now."
+    }
+
+
+def parse_treatment_sections(text: str) -> dict:
+    """Parse Gemini's structured response into a clean dict."""
+    sections = {"symptoms": "", "treatment": "", "prevention": ""}
+    current_key = None
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        lower = line.lower()
+        if lower.startswith("symptoms:"):
+            current_key = "symptoms"
+            sections[current_key] = line.split(":", 1)[-1].strip()
+        elif lower.startswith("treatment:"):
+            current_key = "treatment"
+            sections[current_key] = line.split(":", 1)[-1].strip()
+        elif lower.startswith("prevention:"):
+            current_key = "prevention"
+            sections[current_key] = line.split(":", 1)[-1].strip()
+        elif current_key:
+            # Continuation lines
+            sections[current_key] += " " + line
+
+    return sections
+
+
+# =====================
 # FastAPI App
 # =====================
 app = FastAPI()
@@ -155,7 +287,7 @@ async def predict(file: UploadFile = File(...)):
             }
 
         # =====================
-        # Continue to Model
+        # Model Inference
         # =====================
         img_np = np.array(image)
 
@@ -172,15 +304,23 @@ async def predict(file: UploadFile = File(...)):
         top_label = idx_to_label[top_idx].replace("___", " ").replace("_", " ")
         confidence = float(probs[top_idx])
 
-        all_probs = {
-            idx_to_label[i].replace("___", " ").replace("_", " "): float(p)
-            for i, p in enumerate(probs)
+        # =====================
+        # Gemini Treatment Plan
+        # =====================
+        gemini_result = await get_treatment_plan(top_label)
+
+        response = {
+            "prediction": top_label,
+            "confidence": confidence,
         }
 
-        return {
-            "prediction": top_label,
-            "confidence": confidence
-        }
+        if gemini_result["treatment_plan"] is not None:
+            response["treatment_plan"] = gemini_result["treatment_plan"]
+            response["model_used"] = gemini_result.get("model_used", "unknown")
+        else:
+            response["treatment_plan_status"] = gemini_result["treatment_plan_status"]
+
+        return response
 
     except Exception as e:
         return {
