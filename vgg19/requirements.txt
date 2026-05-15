@@ -15,3 +15,5 @@ Pillow==11.0.0
 
 # Numerical
 numpy==1.26.4
+
+httpx==0.28.1
