@@ -9,6 +9,7 @@ import numpy as np
 import io
 import os
 import httpx
+import cv2
 from dotenv import load_dotenv
 
 # =====================
@@ -91,8 +92,9 @@ model.load_state_dict(torch.load(os.path.join(BASE_DIR, "vgg19_rgb_model.pth"), 
 model = model.to(device)
 model.eval()
 
-import cv2
-
+# =====================
+# Leaf Detection
+# =====================
 LEAF_GREEN_THRESHOLD = 0.08
 LEAF_YELLOW_THRESHOLD = 0.08
 
@@ -126,6 +128,75 @@ def detect_leaf(image: Image.Image):
     }
 
 # =====================
+# GrabCut Segmentation
+# =====================
+
+# Foreground ratio thresholds — outside this range the mask is considered invalid
+GRABCUT_MIN_FOREGROUND_RATIO = 0.10  # all-black mask → GrabCut saw nothing
+GRABCUT_MAX_FOREGROUND_RATIO = 0.97  # all-white mask → GrabCut couldn't separate fg/bg
+
+
+def _is_mask_valid(mask_binary: np.ndarray) -> bool:
+    """Return True only if the mask has a meaningful foreground region."""
+    foreground_ratio = mask_binary.mean()
+    return GRABCUT_MIN_FOREGROUND_RATIO < foreground_ratio < GRABCUT_MAX_FOREGROUND_RATIO
+
+
+def segment_leaf(image: Image.Image) -> np.ndarray:
+    """
+    Apply GrabCut segmentation to isolate the leaf and replace the background
+    with neutral gray (128, 128, 128) — close to the ImageNet pixel mean —
+    so the model focuses on the leaf rather than background clutter.
+
+    If GrabCut produces an invalid mask (all-black, all-white, or raises an
+    exception), the original image is returned unchanged so inference is not
+    harmed by a bad segmentation.
+
+    Returns a uint8 RGB numpy array ready for the albumentations pipeline.
+    """
+    img_rgb = np.array(image.convert("RGB"))
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    h, w = img_bgr.shape[:2]
+
+    # ---- Run GrabCut ----
+    try:
+        mask = np.zeros(img_bgr.shape[:2], np.uint8)
+        bgd_model = np.zeros((1, 65), np.float64)
+        fgd_model = np.zeros((1, 65), np.float64)
+
+        # Rect covers most of the image, leaving a small border for background samples
+        rect = (10, 10, w - 20, h - 20)
+        cv2.grabCut(img_bgr, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+
+        # Definite/probable foreground → 1, everything else → 0
+        mask_binary = np.where((mask == 2) | (mask == 0), 0, 1).astype("uint8")
+
+    except Exception as e:
+        print(f"[WARN] GrabCut exception: {e} — using original image.")
+        return img_rgb
+
+    # ---- Quality gate: fall back if mask is unusable ----
+    if not _is_mask_valid(mask_binary):
+        fg_ratio = float(mask_binary.mean())
+        print(f"[WARN] GrabCut mask rejected (fg_ratio={fg_ratio:.3f}) — using original image.")
+        return img_rgb
+
+    # ---- Good mask: blend leaf with neutral gray background ----
+    # Smooth hard edges to avoid border artifacts
+    mask_blurred = cv2.GaussianBlur(mask_binary * 255, (15, 15), 0)
+
+    # Float alpha [0, 1] with extra channel dim for broadcasting
+    mask_alpha = (mask_blurred / 255.0)[:, :, np.newaxis]
+
+    # Neutral gray background — close to ImageNet pixel mean
+    gray_bg = np.full(img_rgb.shape, 128, dtype=np.uint8)
+
+    # Alpha-blend: leaf pixels from original, background pixels from gray
+    segmented = (img_rgb * mask_alpha + gray_bg * (1.0 - mask_alpha)).astype(np.uint8)
+    return segmented
+
+
+# =====================
 # Gemini Treatment Plan
 # =====================
 
@@ -137,7 +208,7 @@ GEMINI_MODELS = [
     "gemini-1.5-flash",
 ]
 
-load_dotenv(override = True)
+load_dotenv(override=True)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 GEMINI_PROMPT_TEMPLATE = """You are a plant pathology expert. For the plant disease "{disease_name}", provide a brief structured response with exactly these 3 sections:
@@ -287,10 +358,16 @@ async def predict(file: UploadFile = File(...)):
             }
 
         # =====================
+        # GrabCut Segmentation
+        # Isolate the leaf and replace the background with neutral gray (128, 128, 128)
+        # before passing to the model. Falls back to the original image automatically
+        # if the mask is invalid (all-black, all-white, or GrabCut raises an exception).
+        # =====================
+        img_np = segment_leaf(image)
+
+        # =====================
         # Model Inference
         # =====================
-        img_np = np.array(image)
-
         img_tensor = valid_transform(image=img_np)["image"]
         img_tensor = img_tensor.unsqueeze(0).to(device)
 
